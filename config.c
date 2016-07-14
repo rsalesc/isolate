@@ -18,6 +18,7 @@ char *cf_cg_root;
 int cf_first_uid;
 int cf_first_gid;
 int cf_num_boxes;
+int cf_buffer_size;
 
 static int line_number;
 
@@ -58,6 +59,8 @@ void cf_entry(char *key, char *val)
     cf_first_gid = cf_int(val);
   else if (!strcmp(key, "num_boxes"))
     cf_num_boxes = cf_int(val);
+  else if (!strcmp(key, "buffer_size"))
+    cf_buffer_size = cf_int(val);
   else
     cf_err("Unknown configuration item");
 }
@@ -69,7 +72,8 @@ cf_check(void)
       !cf_cg_root ||
       !cf_first_uid ||
       !cf_first_gid ||
-      !cf_num_boxes)
+      !cf_num_boxes ||
+      !cf_buffer_size)
     cf_err("Configuration is not complete");
 }
 

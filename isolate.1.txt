@@ -72,6 +72,16 @@ OPTIONS
 	IDs to them by this option. See the discussion on UIDs in the INSTALLATION
 	section. The ID defaults to 0.
 
+*-B, --bufferize=*'limit'::
+  If set to a positive number, enforces the output of the program to be
+  buffered. The size of the buffer is set in default.cf. <limit> denotes
+  the output limit of the program in KB. If the program exceeds this limit,
+  it will get OL (output limit exceeded) as a verdict, with exitcode 1.
+  Moreover, *--stdout* and *--stderr* now must be absolute paths to the
+  files. <limit> equals to 0 means that the output should not be buffered.
+  In this case, everything else acts as usual (there's no such thing as
+  OL as well). Defaults to 0.
+
 *-k, --stack=*'size'::
 	Limit process stack to 'size' kilobytes. By default, the whole address
 	space is available for the stack, but it is subject to the *--mem* limit.

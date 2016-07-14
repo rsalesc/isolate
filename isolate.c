@@ -5,6 +5,10 @@
  *	(c) 2012-2014 Bernard Blackham <bernard@blackham.com.au>
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "isolate.h"
 
 #include <errno.h>
@@ -35,7 +39,15 @@
 #define MS_REC     (1 << 14)
 #endif
 
+//#define DEBUG_ON
+
+#ifdef DEBUG_ON
+#define DBG(x) x
+#else
+#define DBG(x)
+#endif
 #define TIMER_INTERVAL_US 100000
+#define int64 long long
 
 static int timeout;			/* milliseconds */
 static int wall_timeout;
@@ -46,6 +58,7 @@ static int silent;
 static int fsize_limit;
 static int memory_limit;
 static int stack_limit;
+static int64 buffer_size;
 int block_quota;
 int inode_quota;
 static int max_processes = 1;
@@ -74,12 +87,121 @@ static int ticks_per_sec;
 static int total_ms, wall_ms;
 static volatile sig_atomic_t timer_tick, interrupt;
 
+#define PipeIn(x)      (x##_pipe[0])
+#define PipeOut(x)     (x##_pipe[1])
+
+static int64 stdout_total_read;
+static int64 stderr_total_read;
+static int stderr_pipe[2];
+static int stdout_pipe[2];
+char * stdout_buffer;
+char * stderr_buffer;
+static int stdout_buffered = 0;
+static int stderr_buffered = 0;
+//static int read_iters = 1024;
+static int ole;
+
+static int parent_fd_stdout = -1;
+static int parent_fd_stderr = -1;
+
+char * caller_wd;
+
 static int error_pipes[2];
 static int write_errors_to_fd;
 static int read_errors_from_fd;
 
 static int get_wall_time_ms(void);
 static int get_run_time_ms(struct rusage *rus);
+
+int died;
+
+/*** Buffer flush ***/
+// TODO: maybe check if all the bytes were really written?
+static void
+buffer_flush(char * buf, int * buffered, int redir_fd){
+  int consume = *buffered;
+  *buffered = 0;
+  if(consume <= 0) return;
+
+  if(redir_fd >= 0){
+    if(write(redir_fd, buf, consume) == -1)
+      die("Output/error could not be flushed to file");
+  }
+}
+
+// TODO: make it faster reading reasonably large chunks instead of just one byte
+// TODO: introduce OLE
+static void
+check_buffers(){
+  int bytesRead;
+  if(ole) return;
+
+  // stdout
+  {
+    do{
+      bytesRead = read(PipeIn(stdout), stdout_buffer+stdout_buffered, 
+          cf_buffer_size - stdout_buffered);
+      if(bytesRead > 0) {
+        stdout_total_read += bytesRead;
+        if(stdout_total_read > buffer_size){
+          ole = 1;
+          break;
+        }
+
+        if((stdout_buffered += bytesRead) == cf_buffer_size)
+          buffer_flush(stdout_buffer, &stdout_buffered,
+              parent_fd_stdout >= 0 ? parent_fd_stdout : 1);
+      }
+      else if(bytesRead < 0 && errno != EAGAIN)
+        die("read from pipe: %m");
+
+    } while(bytesRead > 0);
+  }
+
+  // stderr
+  {
+    do{
+      bytesRead = read(PipeIn(stderr), stderr_buffer+stderr_buffered, 
+          cf_buffer_size - stderr_buffered);
+      if(bytesRead > 0) {
+        stderr_total_read += bytesRead;
+
+        if(stderr_total_read > buffer_size){
+          ole = 1;
+          break;
+        }
+
+        if((stderr_buffered += bytesRead) == cf_buffer_size)
+          buffer_flush(stderr_buffer, &stderr_buffered, 
+              parent_fd_stderr >= 0 ? parent_fd_stderr : 2);
+      }
+      else if(bytesRead < 0 && errno != EAGAIN)
+        die("read from pipe: %m");
+
+    } while(bytesRead > 0);
+  }
+
+}
+
+static void
+flush_all_buffers(){
+  if(buffer_size > 0){
+    check_buffers();
+
+    DBG(fprintf(stderr, "flushing buffers %d %d", stdout_total_read, stderr_total_read));
+    buffer_flush(stdout_buffer, &stdout_buffered,
+              parent_fd_stdout >= 0 ? parent_fd_stdout : 1);
+    buffer_flush(stderr_buffer, &stderr_buffered,
+              parent_fd_stderr >= 0 ? parent_fd_stderr : 1);
+
+  }
+}
+
+static void
+override_pipe_size(int fd){
+  if(fcntl(fd, F_SETPIPE_SZ, &cf_buffer_size) < 0)
+    die("pipe override: %m");
+}
 
 /*** Messages and exits ***/
 
@@ -118,6 +240,11 @@ box_exit(int rc)
 	final_stats(&rus);
     }
 
+  if(rc < 2 && !ole) {
+    flush_all_buffers();
+    if(ole) err("OL: output limit exceeded");
+  }
+
   if (rc < 2 && cleanup_ownership)
     chowntree("box", orig_uid, orig_gid);
 
@@ -131,6 +258,7 @@ flush_line(void)
   if (partial_line)
     fputc('\n', stderr);
   partial_line = 0;
+
 }
 
 /* Report an error of the sandbox itself */
@@ -144,18 +272,18 @@ die(char *msg, ...)
 
   // If the child process is still running, show no mercy.
   if (box_pid > 0)
-    {
-      kill(-box_pid, SIGKILL);
-      kill(box_pid, SIGKILL);
-    }
+  {
+    kill(-box_pid, SIGKILL);
+    kill(box_pid, SIGKILL);
+  }
 
   if (write_errors_to_fd)
-    {
-      // We are inside the box, have to use error pipe for error reporting.
-      // We hope that the whole error message fits in PIPE_BUF bytes.
-      write(write_errors_to_fd, buf, n);
-      exit(2);
-    }
+  {
+    // We are inside the box, have to use error pipe for error reporting.
+    // We hope that the whole error message fits in PIPE_BUF bytes.
+    write(write_errors_to_fd, buf, n);
+    exit(2);
+  }
 
   // Otherwise, we in the box keeper process, so we report errors normally
   flush_line();
@@ -365,8 +493,9 @@ check_timeout(void)
   if (wall_timeout)
     {
       int wall_ms = get_wall_time_ms();
-      if (wall_ms > wall_timeout)
+      if (wall_ms > wall_timeout){
         err("TO: Time limit exceeded (wall clock)");
+      }
       if (verbose > 1)
         fprintf(stderr, "[wall time check: %d msec]\n", wall_ms);
     }
@@ -402,79 +531,126 @@ box_keeper(void)
 	.it_value = { .tv_usec = TIMER_INTERVAL_US },
       };
       setitimer(ITIMER_REAL, &timer, NULL);
+    } 
+
+
+  // setup buffer stuff
+  if(buffer_size > 0){
+    stdout_buffer = (char*)malloc(cf_buffer_size+2);
+    stderr_buffer = (char*)malloc(cf_buffer_size+2);
+
+    if(!stdout_buffer || !stderr_buffer)
+      die("Could not allocate output buffers");
+    
+    // make read non-blocking
+    if(fcntl(PipeIn(stdout), F_SETFL, fcntl(PipeIn(stdout), F_GETFL) | O_NONBLOCK) < 0 ||
+        fcntl(PipeIn(stderr), F_SETFL, fcntl(PipeIn(stderr), F_GETFL) | O_NONBLOCK))
+      die("pipe non-block: %m");
+
+    // change dir to box dir as needed
+    char * old_dir = get_current_dir_name();
+    if(!old_dir)
+      die("Could not retrieve current (box) dir name. Is the sandbox running with enough privileges?");
+
+    if(chdir(caller_wd))
+      die("chdir: %m (outside)");
+
+    // open needed descriptors
+    if(redir_stdout){
+      if ((parent_fd_stdout = open(redir_stdout, O_WRONLY | O_CREAT | O_TRUNC, 0666)) == -1)
+        die("Parent redirection to output file could not be established");
+
+      DBG(fprintf(stderr, "stdout fd: %d in %s (%s)\n", parent_fd_stdout, redir_stdout, old_dir));
     }
+
+    if(redir_stderr){
+      if ((parent_fd_stderr = open(redir_stderr, O_WRONLY | O_CREAT | O_TRUNC, 0666)) == -1)
+        die("Parent redirection to error file could not be established");
+    }
+
+    if(chdir(old_dir))
+      die("chdir: %m (outside)");
+
+    free(old_dir);
+  }
 
   for(;;)
+  {
+    if(buffer_size > 0)
+      check_buffers(); // possibly put this somewhere else?
+
+    if(ole)
+      err("OL: output limit exceeded");
+
+    struct rusage rus;
+    int stat;
+    pid_t p;
+    if (interrupt)
     {
-      struct rusage rus;
-      int stat;
-      pid_t p;
-      if (interrupt)
-	{
-	  meta_printf("exitsig:%d\n", interrupt);
-	  err("SG: Interrupted");
-	}
-      if (timer_tick)
-	{
-	  check_timeout();
-	  timer_tick = 0;
-	}
-      p = wait4(box_pid, &stat, 0, &rus);
-      if (p < 0)
-	{
-	  if (errno == EINTR)
-	    continue;
-	  die("wait4: %m");
-	}
-      if (p != box_pid)
-	die("wait4: unknown pid %d exited!", p);
-      box_pid = 0;
-
-      // Check error pipe if there is an internal error passed from inside the box
-      char interr[1024];
-      int n = read(read_errors_from_fd, interr, sizeof(interr) - 1);
-      if (n > 0)
-	{
-	  interr[n] = 0;
-	  die("%s", interr);
-	}
-
-      if (WIFEXITED(stat))
-	{
-	  final_stats(&rus);
-	  if (WEXITSTATUS(stat))
-	    {
-	      meta_printf("exitcode:%d\n", WEXITSTATUS(stat));
-	      err("RE: Exited with error status %d", WEXITSTATUS(stat));
-	    }
-	  if (timeout && total_ms > timeout)
-	    err("TO: Time limit exceeded");
-	  if (wall_timeout && wall_ms > wall_timeout)
-	    err("TO: Time limit exceeded (wall clock)");
-	  flush_line();
-	  if (!silent)
-	    {
-	      fprintf(stderr, "OK (%d.%03d sec real, %d.%03d sec wall)\n",
-		total_ms/1000, total_ms%1000,
-		wall_ms/1000, wall_ms%1000);
-	    }
-	  box_exit(0);
-	}
-      else if (WIFSIGNALED(stat))
-	{
-	  meta_printf("exitsig:%d\n", WTERMSIG(stat));
-	  final_stats(&rus);
-	  err("SG: Caught fatal signal %d", WTERMSIG(stat));
-	}
-      else if (WIFSTOPPED(stat))
-	{
-	  meta_printf("exitsig:%d\n", WSTOPSIG(stat));
-	  final_stats(&rus);
-	  err("SG: Stopped by signal %d", WSTOPSIG(stat));
-	}
-      else
-	die("wait4: unknown status %x, giving up!", stat);
+      meta_printf("exitsig:%d\n", interrupt);
+      err("SG: Interrupted");
     }
+    if (timer_tick)
+    {
+      check_timeout();
+      timer_tick = 0;
+    }
+    p = wait4(box_pid, &stat, 0, &rus);
+    if (p < 0)
+    {
+      if (errno == EINTR)
+        continue;
+      die("wait4: %m");
+    }
+    if (p != box_pid)
+      die("wait4: unknown pid %d exited!", p);
+    box_pid = 0;
+
+     //Check error pipe if there is an internal error passed from inside the box
+    char interr[1024];
+    int n = read(read_errors_from_fd, interr, sizeof(interr) - 1);
+    if (n > 0)
+    {
+      interr[n] = 0;
+      die("%s", interr);
+    }
+
+    if (WIFEXITED(stat))
+    {
+      final_stats(&rus);
+      if (WEXITSTATUS(stat))
+      {
+        meta_printf("exitcode:%d\n", WEXITSTATUS(stat));
+        err("RE: Exited with error status %d", WEXITSTATUS(stat));
+      }
+      if (timeout && total_ms > timeout)
+        err("TO: Time limit exceeded");
+      if (wall_timeout && wall_ms > wall_timeout)
+        err("TO: Time limit exceeded (wall clock)");
+      flush_line();
+      if (!silent)
+      {
+        fprintf(stderr, "OK (%d.%03d sec real, %d.%03d sec wall)\n",
+            total_ms/1000, total_ms%1000,
+            wall_ms/1000, wall_ms%1000);
+      }
+      box_exit(0);
+    }
+    else if (WIFSIGNALED(stat))
+    {
+      meta_printf("exitsig:%d\n", WTERMSIG(stat));
+      final_stats(&rus);
+      err("SG: Caught fatal signal %d", WTERMSIG(stat));
+    }
+    else if (WIFSTOPPED(stat))
+    {
+      meta_printf("exitsig:%d\n", WSTOPSIG(stat));
+      final_stats(&rus);
+      err("SG: Stopped by signal %d", WSTOPSIG(stat));
+    }
+    else
+      die("wait4: unknown status %x, giving up!", stat);
+  }
 }
 
 /*** The process running inside the box ***/
@@ -490,7 +666,7 @@ setup_root(void)
    * appearing outside of our namespace.
    * (systemd since version 188 mounts filesystems shared by default).
    */
-  if (mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL) < 0)
+    if (mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL) < 0)
     die("Cannot privatize mounts: %m");
 
   if (mount("none", "root", "tmpfs", 0, "mode=755") < 0)
@@ -518,7 +694,7 @@ setup_credentials(void)
 }
 
 static void
-setup_fds(void)
+setup_fds(int only_stdin)
 {
   if (redir_stdin)
     {
@@ -526,6 +702,8 @@ setup_fds(void)
       if (open(redir_stdin, O_RDONLY) != 0)
 	die("open(\"%s\"): %m", redir_stdin);
     }
+
+  if(only_stdin) return;
   if (redir_stdout)
     {
       close(1);
@@ -583,7 +761,23 @@ box_inside(void *arg)
   cg_enter();
   setup_root();
   setup_credentials();
-  setup_fds();
+  
+  // setup child pipes
+  if(buffer_size > 0){
+    setup_fds(1);
+
+    close(PipeIn(stdout));
+    close(PipeIn(stderr));
+
+    if(dup2(PipeOut(stdout), 1) == -1 ||
+        dup2(PipeOut(stderr), 2) == -1)
+      die("error duping pipe child->parent");
+
+    close(PipeOut(stdout));
+    close(PipeOut(stderr));
+  } else 
+    setup_fds(0);
+
   setup_rlimits();
   char **env = setup_environment();
 
@@ -655,6 +849,20 @@ run(char **argv)
 
   setup_signals();
 
+  // setup pipes if bufferizable
+  if(buffer_size > 0){
+    if(pipe(stdout_pipe) != 0)
+      die("stdout pipe could not be created");
+    if(pipe(stderr_pipe) != 0)
+      die("stderr pipe could not be created");
+
+    DBG(fprintf(stderr, "(%d, %d, %d, %d)\n", stdout_pipe[0], stdout_pipe[1], stderr_pipe[0], stderr_pipe[1]));
+    override_pipe_size(stdout_pipe[0]);
+    override_pipe_size(stdout_pipe[1]);
+    override_pipe_size(stderr_pipe[0]);
+    override_pipe_size(stdout_pipe[1]);
+  }
+
   box_pid = clone(
     box_inside,			// Function to execute as the body of the new process
     argv,			// Pass our stack
@@ -692,6 +900,7 @@ Usage: isolate [<options>] <command>\n\
 \n\
 Options:\n\
 -b, --box-id=<id>\tWhen multiple sandboxes are used in parallel, each must get a unique ID\n\
+-B, --bufferize=<size>\tBuffer the output/error of the program and limit it to <size> KB\n\
     --cg\t\tEnable use of control groups\n\
     --cg-mem=<size>\tLimit memory usage of the control group to <size> KB\n\
     --cg-timing\t\tTime limits affects total run time of the control group\n\
@@ -745,10 +954,11 @@ enum opt_code {
   OPT_SHARE_NET,
 };
 
-static const char short_opts[] = "b:c:d:eE:i:k:m:M:o:p::q:r:st:vw:x:";
+static const char short_opts[] = "b:B:c:d:eE:i:k:m:M:o:p::q:r:st:vw:x:";
 
 static const struct option long_opts[] = {
   { "box-id",		1, NULL, 'b' },
+  { "bufferize", 1, NULL, 'B' }, 
   { "chdir",		1, NULL, 'c' },
   { "cg",		0, NULL, OPT_CG },
   { "cg-mem",		1, NULL, OPT_CG_MEM },
@@ -787,12 +997,18 @@ main(int argc, char **argv)
 
   init_dir_rules();
 
+  if((caller_wd = get_current_dir_name()) == 0)
+    die("Could not retrieve caller working directory");
+
   while ((c = getopt_long(argc, argv, short_opts, long_opts, NULL)) >= 0)
     switch (c)
       {
       case 'b':
 	box_id = atoi(optarg);
 	break;
+      case 'B':
+  buffer_size = atoll(optarg)*1024;
+  break;
       case 'c':
 	set_cwd = optarg;
 	break;
