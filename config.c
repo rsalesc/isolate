@@ -15,12 +15,14 @@
 
 char *cf_box_root;
 char *cf_cg_root;
+char *cf_cg_parent;
 int cf_first_uid;
 int cf_first_gid;
 int cf_num_boxes;
 int cf_buffer_size;
 
 static int line_number;
+static struct cf_per_box *per_box_configs;
 
 static void NONRET
 cf_err(char *msg)
@@ -47,12 +49,15 @@ cf_int(char *val)
   return x;
 }
 
-void cf_entry(char *key, char *val)
+static void
+cf_entry_toplevel(char *key, char *val)
 {
   if (!strcmp(key, "box_root"))
     cf_box_root = cf_string(val);
   else if (!strcmp(key, "cg_root"))
     cf_cg_root = cf_string(val);
+  else if (!strcmp(key, "cg_parent"))
+    cf_cg_parent = cf_string(val);
   else if (!strcmp(key, "first_uid"))
     cf_first_uid = cf_int(val);
   else if (!strcmp(key, "first_gid"))
@@ -63,6 +68,35 @@ void cf_entry(char *key, char *val)
     cf_buffer_size = cf_int(val);
   else
     cf_err("Unknown configuration item");
+}
+
+static void
+cf_entry_compound(char *key, char *subkey, char *val)
+{
+  if (strncmp(key, "box", 3))
+    cf_err("Unknown configuration section");
+  int box_id = cf_int(key + 3);
+  struct cf_per_box *c = cf_per_box(box_id);
+
+  if (!strcmp(subkey, "cpus"))
+    c->cpus = cf_string(val);
+  else if (!strcmp(subkey, "mems"))
+    c->mems = cf_string(val);
+  else
+    cf_err("Unknown per-box configuration item");
+}
+
+static void
+cf_entry(char *key, char *val)
+{
+  char *dot = strchr(key, '.');
+  if (!dot)
+    cf_entry_toplevel(key, val);
+  else
+    {
+      *dot++ = 0;
+      cf_entry_compound(key, dot, val);
+    }
 }
 
 static void
@@ -112,4 +146,26 @@ cf_parse(void)
 
   fclose(f);
   cf_check();
+}
+
+struct cf_per_box *
+cf_per_box(int box_id)
+{
+  struct cf_per_box *c;
+
+  for (c = per_box_configs; c; c = c->next)
+    if (c->box_id == box_id)
+      return c;
+
+  c = xmalloc(sizeof(*c));
+  c->next = per_box_configs;
+  per_box_configs = c;
+  c->box_id = box_id;
+  return c;
+}
+
+struct cf_per_box *
+cf_current_box(void)
+{
+  return cf_per_box(box_id);
 }

@@ -954,7 +954,11 @@ enum opt_code {
   OPT_SHARE_NET,
 };
 
-static const char short_opts[] = "b:B:c:d:eE:i:k:m:M:o:p::q:r:st:vw:x:";
+<<<<<<< HEAD
+static const char short_opts[] = "b:B:c:d:eE:f:i:k:m:M:o:p::q:r:st:vw:x:";
+=======
+static const char short_opts[] = "b:c:d:eE:f:i:k:m:M:o:p::q:r:st:vw:x:";
+>>>>>>> 7f55e36a27c17f07bd90e254d0eadefdac09a4d6
 
 static const struct option long_opts[] = {
   { "box-id",		1, NULL, 'b' },
@@ -1019,9 +1023,6 @@ main(int argc, char **argv)
 	if (!set_dir_action(optarg))
 	  usage("Invalid directory specified: %s\n", optarg);
 	break;
-      case 'f':
-        fsize_limit = atoi(optarg);
-        break;
       case 'e':
 	pass_environ = 1;
 	break;
@@ -1029,6 +1030,9 @@ main(int argc, char **argv)
 	if (!set_env_action(optarg))
 	  usage("Invalid environment specified: %s\n", optarg);
 	break;
+      case 'f':
+        fsize_limit = atoi(optarg);
+        break;
       case 'k':
 	stack_limit = atoi(optarg);
 	break;

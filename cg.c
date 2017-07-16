@@ -7,10 +7,12 @@
 
 #include "isolate.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -24,6 +26,7 @@ typedef enum {
   CG_CPUACCT,
   CG_CPUSET,
   CG_NUM_CONTROLLERS,
+  CG_PARENT = 256,
 } cg_controller;
 
 static const struct cg_controller_desc cg_controllers[CG_NUM_CONTROLLERS+1] = {
@@ -39,22 +42,29 @@ static const struct cg_controller_desc cg_controllers[CG_NUM_CONTROLLERS+1] = {
 
 static const char *cg_controller_name(cg_controller c)
 {
+  assert(c < CG_NUM_CONTROLLERS);
   return cg_controllers[c].name;
 }
 
 static int cg_controller_optional(cg_controller c)
 {
+  assert(c < CG_NUM_CONTROLLERS);
   return cg_controllers[c].optional;
 }
 
 static char cg_name[256];
+static char cg_parent_name[256];
 
 #define CG_BUFSIZE 1024
 
 static void
 cg_makepath(char *buf, size_t len, cg_controller c, const char *attr)
 {
-  snprintf(buf, len, "%s/%s/%s/%s", cf_cg_root, cg_controller_name(c), cg_name, attr);
+  snprintf(buf, len, "%s/%s/%s/%s",
+    cf_cg_root,
+    cg_controller_name(c & ~CG_PARENT),
+    (c & CG_PARENT) ? cg_parent_name : cg_name,
+    attr);
 }
 
 static int
@@ -161,8 +171,17 @@ cg_init(void)
   if (!dir_exists(cf_cg_root))
     die("Control group filesystem at %s not mounted", cf_cg_root);
 
-  snprintf(cg_name, sizeof(cg_name), "box-%d", box_id);
-  msg("Using control group %s\n", cg_name);
+  if (cf_cg_parent)
+    {
+      snprintf(cg_name, sizeof(cg_name), "%s/box-%d", cf_cg_parent, box_id);
+      snprintf(cg_parent_name, sizeof(cg_parent_name), "%s", cf_cg_parent);
+    }
+  else
+    {
+      snprintf(cg_name, sizeof(cg_name), "box-%d", box_id);
+      strcpy(cg_parent_name, ".");
+    }
+  msg("Using control group %s under parent %s\n", cg_name, cg_parent_name);
 }
 
 void
@@ -189,11 +208,14 @@ cg_prepare(void)
 	die("Failed to create control group %s: %m", path);
     }
 
-  // If cpuset module is enabled, copy allowed cpus and memory nodes from parent group
-  if (cg_read(CG_CPUSET, "?cpuset.cpus", buf))
-    cg_write(CG_CPUSET, "cpuset.cpus", "%s", buf);
-  if (cg_read(CG_CPUSET, "?cpuset.mems", buf))
-    cg_write(CG_CPUSET, "cpuset.mems", "%s", buf);
+  // If the cpuset module is enabled, set up allowed cpus and memory nodes.
+  // If per-box configuration exists, use it; otherwise, inherit the settings
+  // from the parent cgroup.
+  struct cf_per_box *cf = cf_current_box();
+  if (cg_read(CG_PARENT | CG_CPUSET, "?cpuset.cpus", buf))
+    cg_write(CG_CPUSET, "cpuset.cpus", "%s", cf->cpus ? cf->cpus : buf);
+  if (cg_read(CG_PARENT | CG_CPUSET, "?cpuset.mems", buf))
+    cg_write(CG_CPUSET, "cpuset.mems", "%s", cf->mems ? cf->mems : buf);
 }
 
 void
