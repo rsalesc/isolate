@@ -22,7 +22,7 @@ int cf_num_boxes;
 int cf_buffer_size;
 
 static int line_number;
-static struct cf_per_box *per_box_configs;
+static struct cf_per_box *per_box_configs = 0;
 
 static void NONRET
 cf_err(char *msg)
@@ -161,6 +161,8 @@ cf_per_box(int box_id)
   c->next = per_box_configs;
   per_box_configs = c;
   c->box_id = box_id;
+  c->cpus = 0;
+  c->mems = 0;
   return c;
 }
 

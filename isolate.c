@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/vfs.h>
+#include <poll.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -138,7 +139,7 @@ check_buffers(){
 
   // stdout
   {
-    do{
+    while (poll(&(struct pollfd){ .fd = PipeIn(stdout), .events = POLLIN }, 1, 0) == 1) {
       bytesRead = read(PipeIn(stdout), stdout_buffer+stdout_buffered, 
           cf_buffer_size - stdout_buffered);
       if(bytesRead > 0) {
@@ -155,12 +156,12 @@ check_buffers(){
       else if(bytesRead < 0 && errno != EAGAIN)
         die("read from pipe: %m");
 
-    } while(bytesRead > 0);
+    }
   }
 
   // stderr
   {
-    do{
+    while (poll(&(struct pollfd){ .fd = PipeIn(stderr), .events = POLLIN }, 1, 0) == 1) {
       bytesRead = read(PipeIn(stderr), stderr_buffer+stderr_buffered, 
           cf_buffer_size - stderr_buffered);
       if(bytesRead > 0) {
@@ -178,7 +179,7 @@ check_buffers(){
       else if(bytesRead < 0 && errno != EAGAIN)
         die("read from pipe: %m");
 
-    } while(bytesRead > 0);
+    }
   }
 
 }
@@ -541,11 +542,6 @@ box_keeper(void)
 
     if(!stdout_buffer || !stderr_buffer)
       die("Could not allocate output buffers");
-    
-    // make read non-blocking
-    if(fcntl(PipeIn(stdout), F_SETFL, fcntl(PipeIn(stdout), F_GETFL) | O_NONBLOCK) < 0 ||
-        fcntl(PipeIn(stderr), F_SETFL, fcntl(PipeIn(stderr), F_GETFL) | O_NONBLOCK))
-      die("pipe non-block: %m");
 
     // change dir to box dir as needed
     char * old_dir = get_current_dir_name();
@@ -954,11 +950,7 @@ enum opt_code {
   OPT_SHARE_NET,
 };
 
-<<<<<<< HEAD
 static const char short_opts[] = "b:B:c:d:eE:f:i:k:m:M:o:p::q:r:st:vw:x:";
-=======
-static const char short_opts[] = "b:c:d:eE:f:i:k:m:M:o:p::q:r:st:vw:x:";
->>>>>>> 7f55e36a27c17f07bd90e254d0eadefdac09a4d6
 
 static const struct option long_opts[] = {
   { "box-id",		1, NULL, 'b' },
